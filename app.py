@@ -1,30 +1,34 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
-import shap
 import matplotlib.pyplot as plt
+import shap
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.svm import SVR
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from xgboost import XGBRegressor
 
 
-# ============================================================
+# =========================================================
 # PAGE CONFIGURATION
-# ============================================================
+# =========================================================
 
 st.set_page_config(
-    page_title="Carbon Emission Analysis",
+    page_title="Carbon Emission AI Analysis",
     page_icon="🌍",
     layout="wide"
 )
 
 
-# ============================================================
-# LOAD FILES
-# ============================================================
-
-@st.cache_resource
-def load_model():
-    return joblib.load("model.pkl")
-
+# =========================================================
+# LOAD DATA
+# =========================================================
 
 @st.cache_data
 def load_dataset():
@@ -36,38 +40,148 @@ def load_cleaned_dataset():
     return pd.read_csv("cleaned_dataset.csv")
 
 
-model = load_model()
 df = load_dataset()
 cleaned_df = load_cleaned_dataset()
 
 
-# ============================================================
+# =========================================================
+# TRAIN MODELS
+# =========================================================
+
+@st.cache_resource
+def train_models():
+
+    features = [
+        "YEAR",
+        "YEARS_SINCE_1750",
+        "YEAR_SQUARED",
+        "COUNTRY"
+    ]
+
+    X = df[features]
+    y = df["OBS_VALUE"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        random_state=42
+    )
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            (
+                "country",
+                OneHotEncoder(
+                    handle_unknown="ignore",
+                    sparse_output=False
+                ),
+                ["COUNTRY"]
+            )
+        ],
+        remainder="passthrough"
+    )
+
+    models = {
+
+        "Linear Regression": LinearRegression(),
+
+        "Random Forest": RandomForestRegressor(
+            n_estimators=200,
+            random_state=42,
+            n_jobs=-1
+        ),
+
+        "SVR": SVR(
+            kernel="rbf",
+            C=100,
+            epsilon=0.1
+        ),
+
+        "XGBoost": XGBRegressor(
+            n_estimators=200,
+            max_depth=6,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            objective="reg:squarederror"
+        )
+    }
+
+    trained_models = {}
+    results = []
+
+    for name, model in models.items():
+
+        pipeline = Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", model)
+        ])
+
+        pipeline.fit(X_train, y_train)
+
+        predictions = pipeline.predict(X_test)
+
+        mae = mean_absolute_error(
+            y_test,
+            predictions
+        )
+
+        rmse = np.sqrt(
+            mean_squared_error(
+                y_test,
+                predictions
+            )
+        )
+
+        r2 = r2_score(
+            y_test,
+            predictions
+        )
+
+        results.append({
+            "Model": name,
+            "MAE": mae,
+            "RMSE": rmse,
+            "R2 Score": r2
+        })
+
+        trained_models[name] = pipeline
+
+    results_df = pd.DataFrame(results)
+
+    results_df = results_df.sort_values(
+        by="R2 Score",
+        ascending=False
+    ).reset_index(drop=True)
+
+    # XGBoost is the primary model for this project
+    primary_model = trained_models["XGBoost"]
+
+    return (
+        trained_models,
+        results_df,
+        primary_model,
+        X_test,
+        y_test
+    )
+
+
+with st.spinner("Preparing AI models..."):
+
+    (
+        trained_models,
+        results_df,
+        model,
+        X_test,
+        y_test
+    ) = train_models()
+
+
+# =========================================================
 # HELPER FUNCTIONS
-# ============================================================
-
-def classify_emission(value):
-
-    if value < 1:
-        return "Low"
-    elif value < 10:
-        return "Moderate"
-    elif value < 100:
-        return "High"
-    else:
-        return "Very High"
-
-
-def get_level_color(level):
-
-    if level == "Low":
-        return "green"
-    elif level == "Moderate":
-        return "orange"
-    elif level == "High":
-        return "orangered"
-    else:
-        return "red"
-
+# =========================================================
 
 def predict_co2(country, year):
 
@@ -83,6 +197,21 @@ def predict_co2(country, year):
     return prediction
 
 
+def classify_emission(value):
+
+    if value < 1:
+        return "Low"
+
+    elif value < 10:
+        return "Moderate"
+
+    elif value < 100:
+        return "High"
+
+    else:
+        return "Very High"
+
+
 def get_shap_explanation(country, year):
 
     input_data = pd.DataFrame({
@@ -92,28 +221,36 @@ def get_shap_explanation(country, year):
         "COUNTRY": [country]
     })
 
-    # Get model and preprocessing
     xgb_model = model.named_steps["model"]
+
     preprocessor = model.named_steps["preprocessor"]
 
-    # Transform input
-    transformed_data = preprocessor.transform(input_data)
+    transformed_data = preprocessor.transform(
+        input_data
+    )
 
-    # SHAP
-    explainer = shap.TreeExplainer(xgb_model)
-    shap_values = explainer.shap_values(transformed_data)
+    explainer = shap.TreeExplainer(
+        xgb_model
+    )
 
-    feature_names = preprocessor.get_feature_names_out()
+    shap_values = explainer.shap_values(
+        transformed_data
+    )
+
+    feature_names = (
+        preprocessor
+        .get_feature_names_out()
+    )
 
     shap_df = pd.DataFrame({
         "Feature": feature_names,
         "SHAP Value": shap_values[0]
     })
 
-    shap_df["Importance"] = shap_df["SHAP Value"].abs()
+    shap_df["Importance"] = (
+        shap_df["SHAP Value"].abs()
+    )
 
-    # Remove one-hot country features that are zero
-    # so that the explanation is easier to understand
     useful_features = []
 
     for _, row in shap_df.iterrows():
@@ -122,14 +259,23 @@ def get_shap_explanation(country, year):
 
         if "COUNTRY_" in feature:
 
-            if transformed_data[0][list(feature_names).index(feature)] != 0:
+            index = list(
+                feature_names
+            ).index(feature)
+
+            if transformed_data[0][index] != 0:
+
                 useful_features.append(row)
 
         else:
+
             useful_features.append(row)
 
     if len(useful_features) > 0:
-        shap_df = pd.DataFrame(useful_features)
+
+        shap_df = pd.DataFrame(
+            useful_features
+        )
 
     shap_df = shap_df.sort_values(
         by="Importance",
@@ -139,80 +285,34 @@ def get_shap_explanation(country, year):
     return shap_df.head(5), shap_df
 
 
-def generate_summary(country, year, prediction, level, shap_df):
+def generate_recommendations(emission_level):
 
-    positive = shap_df[shap_df["SHAP Value"] > 0]
-    negative = shap_df[shap_df["SHAP Value"] < 0]
-
-    summary = (
-        f"The model predicts {prediction:.3f} CO₂ emission units "
-        f"for {country} in {year}. "
-        f"The predicted emission level is {level}."
-    )
-
-    if len(positive) > 0:
-
-        feature = positive.iloc[0]["Feature"]
-
-        feature = feature.replace(
-            "remainder__", ""
-        ).replace(
-            "country__", ""
-        )
-
-        summary += (
-            f" The feature '{feature}' has a positive contribution "
-            f"and increases the model's predicted emission value."
-        )
-
-    if len(negative) > 0:
-
-        feature = negative.iloc[0]["Feature"]
-
-        feature = feature.replace(
-            "remainder__", ""
-        ).replace(
-            "country__", ""
-        )
-
-        summary += (
-            f" Other model features have negative contributions "
-            f"that reduce the predicted value."
-        )
-
-    return summary
-
-
-def generate_recommendations(level):
-
-    if level == "Low":
+    if emission_level == "Low":
 
         return [
             "Continue monitoring CO₂ emission trends.",
             "Maintain energy-efficient practices.",
-            "Increase renewable-energy adoption.",
-            "Promote sustainable transportation.",
-            "Continue using low-carbon technologies."
+            "Increase the use of renewable energy sources.",
+            "Promote sustainable transportation and low-carbon technologies."
         ]
 
-    elif level == "Moderate":
+    elif emission_level == "Moderate":
 
         return [
-            "Improve energy efficiency.",
-            "Increase renewable-energy usage.",
+            "Improve energy efficiency in major energy-consuming activities.",
+            "Increase renewable energy adoption.",
             "Reduce unnecessary energy consumption.",
-            "Promote low-carbon transportation.",
-            "Monitor future emission trends regularly."
+            "Promote low-carbon transportation and technologies."
         ]
 
-    elif level == "High":
+    elif emission_level == "High":
 
         return [
             "Prioritize energy-efficiency improvements.",
-            "Increase renewable and low-carbon energy adoption.",
-            "Reduce dependence on carbon-intensive energy sources.",
-            "Promote energy-efficient transportation.",
-            "Increase monitoring of future CO₂ emissions."
+            "Increase the use of renewable and low-carbon energy sources.",
+            "Reduce dependence on high-carbon energy sources.",
+            "Promote energy-efficient transportation and technologies.",
+            "Continuously monitor future CO₂ emission trends."
         ]
 
     else:
@@ -227,65 +327,45 @@ def generate_recommendations(level):
         ]
 
 
-def get_historical_data(country):
-
-    country_df = df[
-        df["COUNTRY"] == country
-    ].copy()
-
-    country_df = country_df.sort_values("YEAR")
-
-    return country_df
-
-
-# ============================================================
+# =========================================================
 # SIDEBAR
-# ============================================================
+# =========================================================
 
 st.sidebar.title("🌍 Carbon Emission AI")
 
-st.sidebar.markdown(
-    """
-### Navigation
-
-Use the menu below to explore the system.
-"""
+st.sidebar.write(
+    "AI-Based Analysis of Carbon Emission "
+    "Using Machine Learning Techniques"
 )
 
 page = st.sidebar.radio(
-    "Select Page",
+    "Navigation",
     [
-        "🏠 Dashboard",
-        "📊 Data Analysis",
-        "🔮 CO₂ Prediction",
-        "🔍 SHAP Explanation",
-        "💡 Recommendations",
-        "📈 Previous vs Present",
-        "🤖 Model Comparison"
+        "Dashboard",
+        "Data Analysis",
+        "CO₂ Prediction",
+        "SHAP Explanation",
+        "Recommendations",
+        "Previous vs Present",
+        "Model Comparison"
     ]
 )
 
 
-# ============================================================
+# =========================================================
 # DASHBOARD
-# ============================================================
+# =========================================================
 
-if page == "🏠 Dashboard":
+if page == "Dashboard":
 
-    st.title("🌍 AI-Based Carbon Emission Analysis System")
+    st.title("🌍 Carbon Emission AI Dashboard")
 
-    st.markdown(
-        """
-        ### Machine Learning Based CO₂ Emission Prediction
-        This dashboard uses an XGBoost machine learning model to
-        predict CO₂ emissions, classify emission levels, explain
-        predictions using SHAP, and provide reduction recommendations.
-        """
+    st.write(
+        "AI-based carbon emission analysis using "
+        "machine learning and explainable AI."
     )
 
     st.divider()
-
-    # Dataset statistics
 
     col1, col2, col3, col4 = st.columns(4)
 
@@ -297,25 +377,25 @@ if page == "🏠 Dashboard":
 
     with col2:
         st.metric(
-            "Countries",
+            "Countries / Areas",
             df["COUNTRY"].nunique()
         )
 
     with col3:
         st.metric(
-            "Minimum Year",
-            int(df["YEAR"].min())
+            "Years",
+            f"{df['YEAR'].min()} - {df['YEAR'].max()}"
         )
 
     with col4:
         st.metric(
-            "Maximum Year",
-            int(df["YEAR"].max())
+            "Primary Model",
+            "XGBoost"
         )
 
     st.divider()
 
-    # Country selection
+    st.subheader("Quick CO₂ Prediction")
 
     countries = sorted(
         df["COUNTRY"].dropna().unique()
@@ -324,155 +404,144 @@ if page == "🏠 Dashboard":
     selected_country = st.selectbox(
         "Select Country",
         countries,
-        index=countries.index("India")
-        if "India" in countries else 0
-    )
-
-    latest_year = int(
-        df[df["COUNTRY"] == selected_country]["YEAR"].max()
+        index=(
+            countries.index("India")
+            if "India" in countries
+            else 0
+        )
     )
 
     selected_year = st.number_input(
         "Select Year",
         min_value=int(df["YEAR"].min()),
-        max_value=int(df["YEAR"].max()),
-        value=latest_year
+        max_value=2100,
+        value=2023,
+        step=1
     )
 
-    if st.button(
-        "🔮 Analyze Emission",
-        type="primary"
-    ):
+    prediction = predict_co2(
+        selected_country,
+        selected_year
+    )
 
-        prediction = predict_co2(
-            selected_country,
-            selected_year
+    level = classify_emission(
+        prediction
+    )
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+
+        st.metric(
+            "Predicted CO₂",
+            f"{prediction:.3f}"
         )
 
-        level = classify_emission(prediction)
+    with c2:
 
-        st.session_state["country"] = selected_country
-        st.session_state["year"] = selected_year
-        st.session_state["prediction"] = prediction
-        st.session_state["level"] = level
-
-    # Display prediction if available
-
-    if "prediction" in st.session_state:
-
-        prediction = st.session_state["prediction"]
-        level = st.session_state["level"]
-        country = st.session_state["country"]
-        year = st.session_state["year"]
-
-        st.divider()
-
-        st.subheader("Prediction Result")
-
-        c1, c2, c3 = st.columns(3)
-
-        with c1:
-            st.metric(
-                "Country",
-                country
-            )
-
-        with c2:
-            st.metric(
-                "Predicted CO₂",
-                f"{prediction:.3f}"
-            )
-
-        with c3:
-            st.metric(
-                "Emission Level",
-                level
-            )
-
-        st.info(
-            f"The XGBoost model predicts a **{level}** "
-            f"emission level for **{country}** in **{year}**."
+        st.metric(
+            "Emission Level",
+            level
         )
 
+    st.info(
+        "The prediction is generated using "
+        "XGBoost based on country and year-related "
+        "features available in the dataset."
+    )
 
-# ============================================================
+
+# =========================================================
 # DATA ANALYSIS
-# ============================================================
+# =========================================================
 
-elif page == "📊 Data Analysis":
+elif page == "Data Analysis":
 
-    st.title("📊 Dataset Analysis")
+    st.title("📊 Data Analysis")
 
-    st.subheader("Dataset Information")
+    st.subheader("Dataset Overview")
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.metric(
             "Rows",
-            f"{len(cleaned_df):,}"
+            f"{len(df):,}"
         )
 
     with col2:
         st.metric(
             "Columns",
-            len(cleaned_df.columns)
+            len(df.columns)
         )
 
     with col3:
         st.metric(
             "Missing Values",
-            int(cleaned_df.isnull().sum().sum())
+            int(df.isnull().sum().sum())
         )
 
     st.divider()
 
-    st.subheader("Processed Dataset")
+    st.subheader("Dataset Preview")
 
     st.dataframe(
-        df.head(100),
+        df.head(20),
         use_container_width=True
     )
 
     st.divider()
 
-    st.subheader("Dataset Columns")
+    st.subheader("CO₂ Emission Distribution")
 
-    column_df = pd.DataFrame({
-        "Column": df.columns,
-        "Data Type": [
-            str(df[col].dtype)
-            for col in df.columns
-        ],
-        "Missing Values": [
-            int(df[col].isnull().sum())
-            for col in df.columns
-        ]
-    })
-
-    st.dataframe(
-        column_df,
-        use_container_width=True
+    fig, ax = plt.subplots(
+        figsize=(10, 5)
     )
+
+    ax.hist(
+        df["OBS_VALUE"],
+        bins=50
+    )
+
+    ax.set_xlabel(
+        "CO₂ Emission"
+    )
+
+    ax.set_ylabel(
+        "Frequency"
+    )
+
+    ax.set_title(
+        "Distribution of CO₂ Emissions"
+    )
+
+    st.pyplot(fig)
 
     st.divider()
 
-    st.subheader("Country Distribution")
-
-    country_counts = (
-        df["COUNTRY"]
-        .value_counts()
-        .head(15)
+    st.subheader(
+        "Top 10 Countries by Average CO₂"
     )
 
-    st.bar_chart(country_counts)
+    country_avg = (
+        df.groupby("COUNTRY")["OBS_VALUE"]
+        .mean()
+        .sort_values(
+            ascending=False
+        )
+        .head(10)
+    )
+
+    st.bar_chart(
+        country_avg
+    )
 
 
-# ============================================================
+# =========================================================
 # CO2 PREDICTION
-# ============================================================
+# =========================================================
 
-elif page == "🔮 CO₂ Prediction":
+elif page == "CO₂ Prediction":
 
     st.title("🔮 CO₂ Emission Prediction")
 
@@ -483,15 +552,19 @@ elif page == "🔮 CO₂ Prediction":
     country = st.selectbox(
         "Select Country",
         countries,
-        index=countries.index("India")
-        if "India" in countries else 0
+        index=(
+            countries.index("India")
+            if "India" in countries
+            else 0
+        )
     )
 
     year = st.number_input(
         "Enter Year",
         min_value=int(df["YEAR"].min()),
-        max_value=int(df["YEAR"].max()) + 20,
-        value=2023
+        max_value=2100,
+        value=2023,
+        step=1
     )
 
     if st.button(
@@ -508,14 +581,9 @@ elif page == "🔮 CO₂ Prediction":
             prediction
         )
 
-        st.session_state["country"] = country
-        st.session_state["year"] = year
-        st.session_state["prediction"] = prediction
-        st.session_state["level"] = level
-
-        st.success("Prediction completed successfully!")
-
-        st.divider()
+        st.success(
+            "Prediction completed successfully!"
+        )
 
         col1, col2 = st.columns(2)
 
@@ -533,202 +601,51 @@ elif page == "🔮 CO₂ Prediction":
                 level
             )
 
+        st.divider()
+
+        st.subheader(
+            "Prediction Interpretation"
+        )
+
         if level == "Low":
+
             st.success(
-                "🟢 Low emission level"
+                "The predicted emission level is Low."
             )
 
         elif level == "Moderate":
+
             st.warning(
-                "🟡 Moderate emission level"
+                "The predicted emission level is Moderate."
             )
 
         elif level == "High":
+
             st.warning(
-                "🟠 High emission level"
+                "The predicted emission level is High. "
+                "Carbon-reduction measures should be prioritized."
             )
 
         else:
+
             st.error(
-                "🔴 Very High emission level"
+                "The predicted emission level is Very High. "
+                "Immediate carbon-reduction measures are recommended."
             )
 
 
-# ============================================================
+# =========================================================
 # SHAP EXPLANATION
-# ============================================================
+# =========================================================
 
-elif page == "🔍 SHAP Explanation":
+elif page == "SHAP Explanation":
 
-    st.title("🔍 Why Was This Prediction Made?")
+    st.title("🔍 Explainable AI - SHAP")
 
-    if "prediction" not in st.session_state:
-
-        st.warning(
-            "Please make a prediction first from the CO₂ Prediction page."
-        )
-
-    else:
-
-        country = st.session_state["country"]
-        year = st.session_state["year"]
-        prediction = st.session_state["prediction"]
-        level = st.session_state["level"]
-
-        st.write(
-            f"### {country} — {year}"
-        )
-
-        st.metric(
-            "Predicted CO₂",
-            f"{prediction:.3f}"
-        )
-
-        st.metric(
-            "Emission Level",
-            level
-        )
-
-        st.divider()
-
-        top_features, all_features = get_shap_explanation(
-            country,
-            year
-        )
-
-        st.subheader(
-            "Top Contributing Features"
-        )
-
-        display_df = top_features.copy()
-
-        display_df["Feature"] = (
-            display_df["Feature"]
-            .str.replace("remainder__", "", regex=False)
-            .str.replace("country__", "", regex=False)
-        )
-
-        display_df = display_df[
-            ["Feature", "SHAP Value"]
-        ]
-
-        st.dataframe(
-            display_df,
-            use_container_width=True
-        )
-
-        st.divider()
-
-        st.subheader(
-            "Automatic Explanation"
-        )
-
-        summary = generate_summary(
-            country,
-            year,
-            prediction,
-            level,
-            top_features
-        )
-
-        st.info(summary)
-
-        st.divider()
-
-        st.subheader(
-            "SHAP Feature Contribution"
-        )
-
-        chart_df = top_features.copy()
-
-        chart_df["Feature"] = (
-            chart_df["Feature"]
-            .str.replace("remainder__", "", regex=False)
-            .str.replace("country__", "", regex=False)
-        )
-
-        chart_df = chart_df.set_index(
-            "Feature"
-        )["SHAP Value"]
-
-        st.bar_chart(
-            chart_df
-        )
-
-        st.caption(
-            "Positive SHAP values increase the model prediction; "
-            "negative SHAP values decrease it."
-        )
-
-
-# ============================================================
-# RECOMMENDATIONS
-# ============================================================
-
-elif page == "💡 Recommendations":
-
-    st.title("💡 Carbon Reduction Recommendations")
-
-    if "prediction" not in st.session_state:
-
-        st.warning(
-            "Please make a prediction first."
-        )
-
-    else:
-
-        country = st.session_state["country"]
-        year = st.session_state["year"]
-        prediction = st.session_state["prediction"]
-        level = st.session_state["level"]
-
-        st.subheader(
-            f"Analysis for {country} — {year}"
-        )
-
-        st.metric(
-            "Predicted CO₂",
-            f"{prediction:.3f}"
-        )
-
-        st.metric(
-            "Emission Level",
-            level
-        )
-
-        st.divider()
-
-        st.subheader(
-            "Recommended Actions"
-        )
-
-        recommendations = generate_recommendations(
-            level
-        )
-
-        for recommendation in recommendations:
-
-            st.markdown(
-                f"✅ **{recommendation}**"
-            )
-
-        st.divider()
-
-        st.info(
-            "These recommendations are generated according "
-            "to the predicted emission level. They are "
-            "sustainability recommendations and should not "
-            "be interpreted as causal conclusions from SHAP."
-        )
-
-
-# ============================================================
-# PREVIOUS VS PRESENT
-# ============================================================
-
-elif page == "📈 Previous vs Present":
-
-    st.title("📈 Previous vs Present CO₂ Emission")
+    st.write(
+        "SHAP helps explain how the model features "
+        "contribute to the prediction."
+    )
 
     countries = sorted(
         df["COUNTRY"].dropna().unique()
@@ -737,206 +654,379 @@ elif page == "📈 Previous vs Present":
     country = st.selectbox(
         "Select Country",
         countries,
-        index=countries.index("India")
-        if "India" in countries else 0
+        index=(
+            countries.index("India")
+            if "India" in countries
+            else 0
+        ),
+        key="shap_country"
     )
 
-    country_df = get_historical_data(
-        country
+    year = st.number_input(
+        "Select Year",
+        min_value=int(df["YEAR"].min()),
+        max_value=2100,
+        value=2023,
+        key="shap_year"
     )
 
-    if len(country_df) > 0:
+    if st.button(
+        "Analyze Prediction",
+        type="primary"
+    ):
 
-        latest_year = int(
-            country_df["YEAR"].max()
+        prediction = predict_co2(
+            country,
+            year
         )
 
-        previous_year = latest_year - 1
+        level = classify_emission(
+            prediction
+        )
 
-        latest_data = country_df[
-            country_df["YEAR"] == latest_year
-        ]
-
-        previous_data = country_df[
-            country_df["YEAR"] == previous_year
-        ]
-
-        if len(latest_data) > 0:
-
-            latest_co2 = latest_data[
-                "OBS_VALUE"
-            ].iloc[0]
-
-            st.metric(
-                "Present CO₂",
-                f"{latest_co2:.3f}",
-                help=f"Year: {latest_year}"
+        top_shap, all_shap = (
+            get_shap_explanation(
+                country,
+                year
             )
+        )
 
-        if len(previous_data) > 0:
+        st.metric(
+            "Predicted CO₂",
+            f"{prediction:.3f}"
+        )
 
-            previous_co2 = previous_data[
-                "OBS_VALUE"
-            ].iloc[0]
-
-            change = latest_co2 - previous_co2
-
-            if previous_co2 != 0:
-
-                change_percent = (
-                    change / previous_co2
-                ) * 100
-
-            else:
-
-                change_percent = 0
-
-            col1, col2, col3 = st.columns(3)
-
-            with col1:
-
-                st.metric(
-                    "Previous CO₂",
-                    f"{previous_co2:.3f}"
-                )
-
-            with col2:
-
-                st.metric(
-                    "Present CO₂",
-                    f"{latest_co2:.3f}"
-                )
-
-            with col3:
-
-                st.metric(
-                    "Change %",
-                    f"{change_percent:.2f}%"
-                )
-
-            if change > 0:
-
-                st.error(
-                    f"📈 CO₂ emissions increased by "
-                    f"{abs(change):.3f} units."
-                )
-
-            elif change < 0:
-
-                st.success(
-                    f"📉 CO₂ emissions decreased by "
-                    f"{abs(change):.3f} units."
-                )
-
-            else:
-
-                st.info(
-                    "CO₂ emissions remained unchanged."
-                )
+        st.metric(
+            "Emission Level",
+            level
+        )
 
         st.divider()
 
         st.subheader(
-            "Historical CO₂ Emission Trend"
+            "Top Contributing Features"
         )
 
-        chart_data = country_df[
-            ["YEAR", "OBS_VALUE"]
+        display_shap = top_shap[
+            ["Feature", "SHAP Value"]
         ].copy()
 
-        chart_data = chart_data.set_index(
-            "YEAR"
-        )
-
-        st.line_chart(
-            chart_data
-        )
-
-        st.caption(
-            f"Historical CO₂ emission trend for {country}."
-        )
-
-
-# ============================================================
-# MODEL COMPARISON
-# ============================================================
-
-elif page == "🤖 Model Comparison":
-
-    st.title("🤖 Machine Learning Model Comparison")
-
-    st.write(
-        "Comparison of the machine learning models used "
-        "for CO₂ emission prediction."
-    )
-
-    # Try to load saved comparison file
-
-    try:
-
-        comparison_df = pd.read_csv(
-            "model_comparison.csv"
+        display_shap["Effect"] = (
+            display_shap["SHAP Value"]
+            .apply(
+                lambda x:
+                "Increases prediction"
+                if x > 0
+                else "Decreases prediction"
+            )
         )
 
         st.dataframe(
-            comparison_df,
+            display_shap,
             use_container_width=True
         )
 
         st.divider()
 
         st.subheader(
-            "R² Score Comparison"
+            "SHAP Feature Importance"
         )
 
-        r2_chart = comparison_df[
-            ["Model", "R2 Score"]
-        ].set_index("Model")
+        chart_df = (
+            top_shap
+            .set_index("Feature")
+            ["Importance"]
+        )
 
         st.bar_chart(
-            r2_chart
-        )
-
-        st.divider()
-
-        st.subheader(
-            "RMSE Comparison"
-        )
-
-        rmse_chart = comparison_df[
-            ["Model", "RMSE"]
-        ].set_index("Model")
-
-        st.bar_chart(
-            rmse_chart
-        )
-
-        st.success(
-            "Primary model selected for this project: XGBoost"
-        )
-
-    except FileNotFoundError:
-
-        st.warning(
-            "model_comparison.csv was not found."
+            chart_df
         )
 
         st.info(
-            "Upload model_comparison.csv to the project "
-            "folder to display model comparison results."
+            "SHAP explains model behavior. "
+            "A SHAP contribution should not be interpreted "
+            "as proof of a real-world causal relationship."
         )
 
 
-# ============================================================
+# =========================================================
+# RECOMMENDATIONS
+# =========================================================
+
+elif page == "Recommendations":
+
+    st.title("💡 Carbon Reduction Recommendations")
+
+    countries = sorted(
+        df["COUNTRY"].dropna().unique()
+    )
+
+    country = st.selectbox(
+        "Select Country",
+        countries,
+        index=(
+            countries.index("India")
+            if "India" in countries
+            else 0
+        )
+    )
+
+    year = st.number_input(
+        "Select Year",
+        min_value=int(df["YEAR"].min()),
+        max_value=2100,
+        value=2023
+    )
+
+    prediction = predict_co2(
+        country,
+        year
+    )
+
+    level = classify_emission(
+        prediction
+    )
+
+    st.metric(
+        "Predicted CO₂",
+        f"{prediction:.3f}"
+    )
+
+    st.metric(
+        "Emission Level",
+        level
+    )
+
+    st.divider()
+
+    st.subheader(
+        "Recommended Actions"
+    )
+
+    recommendations = (
+        generate_recommendations(
+            level
+        )
+    )
+
+    for i, recommendation in enumerate(
+        recommendations,
+        start=1
+    ):
+
+        st.write(
+            f"**{i}.** {recommendation}"
+        )
+
+    st.divider()
+
+    st.info(
+        "Recommendations are generated according "
+        "to the predicted emission level. "
+        "The current dataset does not contain "
+        "building-level energy, occupancy or "
+        "temperature variables."
+    )
+
+
+# =========================================================
+# PREVIOUS VS PRESENT
+# =========================================================
+
+elif page == "Previous vs Present":
+
+    st.title("📈 Previous vs Present CO₂")
+
+    countries = sorted(
+        df["COUNTRY"].dropna().unique()
+    )
+
+    country = st.selectbox(
+        "Select Country",
+        countries,
+        index=(
+            countries.index("India")
+            if "India" in countries
+            else 0
+        )
+    )
+
+    country_data = (
+        df[
+            df["COUNTRY"] == country
+        ]
+        .sort_values("YEAR")
+    )
+
+    if len(country_data) >= 2:
+
+        previous_row = (
+            country_data.iloc[-2]
+        )
+
+        latest_row = (
+            country_data.iloc[-1]
+        )
+
+        previous_value = (
+            previous_row["OBS_VALUE"]
+        )
+
+        latest_value = (
+            latest_row["OBS_VALUE"]
+        )
+
+        change = (
+            latest_value -
+            previous_value
+        )
+
+        if previous_value != 0:
+
+            percentage_change = (
+                change /
+                abs(previous_value)
+            ) * 100
+
+        else:
+
+            percentage_change = 0
+
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+
+            st.metric(
+                "Previous Year",
+                int(previous_row["YEAR"])
+            )
+
+        with col2:
+
+            st.metric(
+                "Present Year",
+                int(latest_row["YEAR"])
+            )
+
+        with col3:
+
+            st.metric(
+                "Percentage Change",
+                f"{percentage_change:.2f}%"
+            )
+
+        st.divider()
+
+        comparison_df = pd.DataFrame({
+            "Year": [
+                int(previous_row["YEAR"]),
+                int(latest_row["YEAR"])
+            ],
+            "CO₂": [
+                previous_value,
+                latest_value
+            ]
+        })
+
+        st.line_chart(
+            comparison_df.set_index("Year")
+        )
+
+        if change > 0:
+
+            st.error(
+                f"CO₂ emissions increased by "
+                f"{abs(change):.3f} units."
+            )
+
+        elif change < 0:
+
+            st.success(
+                f"CO₂ emissions decreased by "
+                f"{abs(change):.3f} units."
+            )
+
+        else:
+
+            st.info(
+                "CO₂ emissions remained unchanged."
+            )
+
+    else:
+
+        st.warning(
+            "Not enough historical data available."
+        )
+
+
+# =========================================================
+# MODEL COMPARISON
+# =========================================================
+
+elif page == "Model Comparison":
+
+    st.title("🤖 Machine Learning Model Comparison")
+
+    st.write(
+        "Comparison of the machine learning algorithms "
+        "used for CO₂ prediction."
+    )
+
+    st.dataframe(
+        results_df,
+        use_container_width=True
+    )
+
+    st.divider()
+
+    st.subheader(
+        "R² Score Comparison"
+    )
+
+    r2_chart = results_df.set_index(
+        "Model"
+    )["R2 Score"]
+
+    st.bar_chart(
+        r2_chart
+    )
+
+    st.divider()
+
+    st.subheader(
+        "RMSE Comparison"
+    )
+
+    rmse_chart = results_df.set_index(
+        "Model"
+    )["RMSE"]
+
+    st.bar_chart(
+        rmse_chart
+    )
+
+    st.divider()
+
+    st.success(
+        "Primary Model: XGBoost"
+    )
+
+    st.info(
+        "XGBoost is selected as the primary model "
+        "for this project."
+    )
+
+
+# =========================================================
 # FOOTER
-# ============================================================
+# =========================================================
 
 st.sidebar.divider()
 
 st.sidebar.caption(
-    "AI-Based Analysis of Carbon Emission Using Machine Learning Techniques"
+    "AI-Based Carbon Emission Analysis"
 )
 
 st.sidebar.caption(
-    "Primary Model: XGBoost"
+    "Machine Learning + SHAP"
 )
